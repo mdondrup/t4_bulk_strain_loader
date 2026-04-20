@@ -168,7 +168,7 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
    */
   private function detectDelimiter($file_path) {
     $handle = fopen($file_path, 'r');
-    if (!$handle) {
+    if ($handle === FALSE) {
       $this->logger->warning(t('Could not open @file to auto-detect delimiter; defaulting to comma.', ['@file' => $file_path]));
       return ',';
     }
@@ -195,9 +195,12 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
       "\t" => substr_count($line, "\t"),
       ';' => substr_count($line, ';'),
     ];
+    if (max($counts) === 0) {
+      return ',';
+    }
 
     arsort($counts);
-    return (string) array_key_first($counts);
+    return array_key_first($counts);
   }
 
   /**
