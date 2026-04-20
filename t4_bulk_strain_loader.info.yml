@@ -1,0 +1,8 @@
+name: 'Tripal 4 Bulk Strain Loader'
+type: module
+description: 'Skeleton Tripal4 extension to load strain columns from CSV/TAB files into Chado.'
+package: Tripal
+core_version_requirement: ^10 || ^11
+dependencies:
+  - tripal:tripal
+  - tripal:tripal_chado

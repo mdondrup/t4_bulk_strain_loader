@@ -1,0 +1,4 @@
+services:
+  t4_bulk_strain_loader.strain_column_loader:
+    class: Drupal\\t4_bulk_strain_loader\\Service\\StrainColumnLoader
+    arguments: ['@file_system']
