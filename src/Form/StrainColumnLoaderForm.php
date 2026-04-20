@@ -97,9 +97,6 @@ class StrainColumnLoaderForm extends FormBase {
       return;
     }
 
-    $file->setPermanent();
-    $file->save();
-
     try {
       $result = $this->loader->importFile(
         $file->getFileUri(),
@@ -111,6 +108,9 @@ class StrainColumnLoaderForm extends FormBase {
       $this->messenger()->addError($this->t('Bulk strain load failed: @message', ['@message' => $exception->getMessage()]));
       return;
     }
+
+    $file->setPermanent();
+    $file->save();
 
     $this->messenger()->addStatus($this->t('Processed @total columns. Inserted @inserted strains, skipped @skipped existing strains.', [
       '@total' => $result['total'],
