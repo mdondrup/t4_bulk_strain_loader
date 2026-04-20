@@ -1,0 +1,75 @@
+<?php
+
+/**
+ * @file
+ * Install hooks for t4_bulk_strain_loader.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function t4_bulk_strain_loader_schema() {
+  $schema['t4_bulk_strain_loader_strain'] = [
+    'description' => 'Stores imported kveik strains loaded from spreadsheets.',
+    'fields' => [
+      'strain_id' => [
+        'description' => 'Primary key.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'strain_name' => [
+        'description' => 'Canonical strain name.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ],
+      'source' => [
+        'description' => 'Source from spreadsheet.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => FALSE,
+      ],
+      'brewery' => [
+        'description' => 'Brewery from spreadsheet.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => FALSE,
+      ],
+      'origin' => [
+        'description' => 'Geographic origin from spreadsheet.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => FALSE,
+      ],
+      'notes' => [
+        'description' => 'Free-form notes from spreadsheet.',
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => FALSE,
+      ],
+      'raw_row' => [
+        'description' => 'JSON-encoded normalized row values.',
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => FALSE,
+      ],
+      'changed' => [
+        'description' => 'Unix timestamp for last update.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+    ],
+    'primary key' => ['strain_id'],
+    'unique keys' => [
+      'strain_name' => ['strain_name'],
+    ],
+    'indexes' => [
+      'changed' => ['changed'],
+    ],
+  ];
+
+  return $schema;
+}

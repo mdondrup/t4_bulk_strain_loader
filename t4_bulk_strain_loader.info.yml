@@ -1,0 +1,7 @@
+name: 'T4 Bulk Strain Loader'
+type: module
+description: 'Tripal4 importer plugin for loading kveik strain spreadsheets.'
+core_version_requirement: ^10 || ^11
+package: Tripal
+dependencies:
+  - tripal:tripal
