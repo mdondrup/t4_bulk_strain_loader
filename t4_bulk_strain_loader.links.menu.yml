@@ -1,5 +1,5 @@
 t4_bulk_strain_loader.form:
   title: 'Bulk strain loader'
   description: 'Load strain columns from CSV/TAB files into Chado stock records.'
-  parent: system.admin_structure
+  parent: tripal.admin
   route_name: t4_bulk_strain_loader.form
