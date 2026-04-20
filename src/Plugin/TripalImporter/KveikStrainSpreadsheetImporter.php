@@ -14,13 +14,13 @@ use Drupal\tripal\TripalImporter\TripalImporterBase;
  *   file_types = {"csv", "tsv", "txt"},
  *   upload_description = @Translation("Upload a spreadsheet export in CSV or TSV format."),
  *   upload_title = @Translation("Kveik strain spreadsheet"),
- *   use_analysis = False,
- *   require_analysis = False,
+ *   use_analysis = false,
+ *   require_analysis = false,
  *   button_text = @Translation("Import kveik strains"),
- *   file_upload = True,
- *   file_local = True,
- *   file_remote = False,
- *   file_required = True,
+ *   file_upload = true,
+ *   file_local = true,
+ *   file_remote = false,
+ *   file_required = true,
  *   cardinality = 1,
  *   menu_path = "",
  *   callback = "",
@@ -174,13 +174,17 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
     }
 
     $line = '';
-    while (($line = fgets($handle)) !== FALSE) {
-      $line = trim($line);
-      if ($line !== '') {
-        break;
+    try {
+      while (($line = fgets($handle)) !== FALSE) {
+        $line = trim($line);
+        if ($line !== '') {
+          break;
+        }
       }
     }
-    fclose($handle);
+    finally {
+      fclose($handle);
+    }
 
     if ($line === '') {
       return ',';
@@ -216,7 +220,8 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
       }
     }
 
-    foreach ($file as $line_number => $row) {
+    foreach ($file as $row) {
+      $sheet_row_number = $file->key() + 1;
       if (!is_array($row) || $this->isEmptyRow($row)) {
         continue;
       }
@@ -224,7 +229,7 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
       $normalized = $this->normalizeRow($row, $header);
       $strain_name = trim((string) ($normalized['strain_name'] ?? $normalized['name'] ?? $normalized['strain'] ?? ''));
       if ($strain_name === '') {
-        throw new \InvalidArgumentException('Missing required strain name on row ' . ($line_number + 1) . '. Expected one of: strain_name, name, strain.');
+        throw new \InvalidArgumentException('Missing required strain name on row ' . $sheet_row_number . '. Expected one of: strain_name, name, strain.');
       }
 
       $rows[] = [
