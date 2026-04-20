@@ -87,14 +87,19 @@ class StrainColumnLoader {
           continue;
         }
 
-        $chado->insert('stock')
-          ->fields([
-            'organism_id' => $organism_id,
-            'name' => $name,
-            'uniquename' => $name,
-            'type_id' => $stock_type_id,
-          ])
-          ->execute();
+        try {
+          $chado->insert('stock')
+            ->fields([
+              'organism_id' => $organism_id,
+              'name' => $name,
+              'uniquename' => $name,
+              'type_id' => $stock_type_id,
+            ])
+            ->execute();
+        }
+        catch (\Throwable $exception) {
+          throw new \RuntimeException(sprintf('Failed to insert strain "%s".', $name), 0, $exception);
+        }
 
         $inserted++;
       }

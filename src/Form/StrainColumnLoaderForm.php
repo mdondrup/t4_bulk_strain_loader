@@ -100,11 +100,17 @@ class StrainColumnLoaderForm extends FormBase {
     $file->setPermanent();
     $file->save();
 
-    $result = $this->loader->importFile(
-      $file->getFileUri(),
-      (int) $form_state->getValue('organism_id'),
-      (string) $form_state->getValue('delimiter')
-    );
+    try {
+      $result = $this->loader->importFile(
+        $file->getFileUri(),
+        (int) $form_state->getValue('organism_id'),
+        (string) $form_state->getValue('delimiter')
+      );
+    }
+    catch (\RuntimeException $exception) {
+      $this->messenger()->addError($this->t('Bulk strain load failed: @message', ['@message' => $exception->getMessage()]));
+      return;
+    }
 
     $this->messenger()->addStatus($this->t('Processed @total columns. Inserted @inserted strains, skipped @skipped existing strains.', [
       '@total' => $result['total'],
