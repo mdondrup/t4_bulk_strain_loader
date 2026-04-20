@@ -169,6 +169,7 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
   private function detectDelimiter($file_path) {
     $handle = fopen($file_path, 'r');
     if (!$handle) {
+      $this->logger->warning(t('Could not open @file to auto-detect delimiter; defaulting to comma.', ['@file' => $file_path]));
       return ',';
     }
 
@@ -223,7 +224,7 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
       $normalized = $this->normalizeRow($row, $header);
       $strain_name = trim((string) ($normalized['strain_name'] ?? $normalized['name'] ?? $normalized['strain'] ?? ''));
       if ($strain_name === '') {
-        throw new \Exception('Missing required strain_name value on row ' . ($line_number + 1) . '.');
+        throw new \InvalidArgumentException('Missing required strain name on row ' . ($line_number + 1) . '. Expected one of: strain_name, name, strain.');
       }
 
       $rows[] = [
@@ -262,10 +263,8 @@ class KveikStrainSpreadsheetImporter extends TripalImporterBase {
     }
 
     if (!empty($header)) {
-      return array_combine(
-        $header,
-        array_pad($clean, count($header), '')
-      );
+      $values = array_slice(array_pad($clean, count($header), ''), 0, count($header));
+      return array_combine($header, $values);
     }
 
     return [
