@@ -4,6 +4,7 @@ namespace Drupal\t4_bulk_strain_loader\Service;
 
 use Drupal\Core\File\FileSystemInterface;
 use Drupal\Core\Database\Database;
+use Drupal\Core\Database\Connection;
 
 /**
  * Loads strain columns from CSV/TAB files into Chado stock records.
@@ -72,7 +73,7 @@ class StrainColumnLoader {
       $skipped = 0;
       $transaction = $chado->startTransaction();
       foreach ($strain_names as $name) {
-        $exists = (bool) $chado->select('1:stock', 's')
+        $exists = (bool) $chado->select('stock', 's')
           ->fields('s', ['stock_id'])
           ->condition('uniquename', $name)
           ->condition('organism_id', $organism_id)
@@ -86,7 +87,7 @@ class StrainColumnLoader {
           continue;
         }
 
-        $chado->insert('1:stock')
+        $chado->insert('stock')
           ->fields([
             'organism_id' => $organism_id,
             'name' => $name,
@@ -97,6 +98,7 @@ class StrainColumnLoader {
 
         $inserted++;
       }
+      // Commit via transaction object destruction (Drupal DB transaction API).
       unset($transaction);
 
       return [
@@ -151,10 +153,10 @@ class StrainColumnLoader {
   /**
    * Gets the cvterm_id used for strain stocks.
    */
-  protected function getStrainTypeId($chado): int {
-    $stock_type_id = $chado->select('1:cvterm', 'cvt')
+  protected function getStrainTypeId(Connection $chado): int {
+    $stock_type_id = $chado->select('cvterm', 'cvt')
       ->fields('cvt', ['cvterm_id'])
-      ->join('1:cv', 'cv', 'cv.cv_id = cvt.cv_id')
+      ->join('cv', 'cv', 'cv.cv_id = cvt.cv_id')
       ->condition('cv.name', 'stock_type')
       ->condition('cvt.name', 'strain')
       ->range(0, 1)
