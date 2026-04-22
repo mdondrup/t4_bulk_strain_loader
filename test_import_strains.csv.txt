@@ -1,0 +1,4 @@
+Name,Uniquename,Description,taxid
+"Tore Testers kveik","kveikbank-83927","Oh my gosh, that's a tasty booze",
+"Snørre åse1 kvikk","kveikbank-638288","120%",
+"Willi wursts kveik","kveikbank-32911","It's not at Beer it's a Wurst (or Supergrobi)",

@@ -1,3 +1,0 @@
-administer t4 bulk strain loader:
-  title: 'Administer Tripal4 bulk strain loader'
-  description: 'Upload CSV/TAB files and load strain columns into Chado.'

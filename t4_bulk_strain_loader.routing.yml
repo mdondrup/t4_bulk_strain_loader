@@ -1,7 +1,0 @@
-t4_bulk_strain_loader.form:
-  path: '/admin/tripal/loaders/bulk-strains'
-  defaults:
-    _form: '\\Drupal\\t4_bulk_strain_loader\\Form\\StrainColumnLoaderForm'
-    _title: 'Bulk strain loader'
-  requirements:
-    _permission: 'administer t4 bulk strain loader'
