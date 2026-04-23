@@ -4,6 +4,8 @@ namespace Drupal\t4_bulk_strain_loader\Plugin\TripalImporter;
 
 use Drupal\Core\Database\Connection;
 use Drupal\tripal_chado\TripalImporter\ChadoImporterBase;
+use Drupal\tripal_chado\TripalEntity;
+use Drupal\tripal_chado\Plugin\TripalBackendPublish\ChadoPublish;
 
 /**
  * Provides a Strain Bulk Loader.
@@ -161,6 +163,9 @@ class StrainBulkLoader extends ChadoImporterBase
 
             // Build column-name => index map.
             $col_map = $this->mapHeaderColumns($raw_header);
+            $this->logger->info('Parsed header columns: @cols', [
+                '@cols' => implode(', ', array_keys($col_map)),
+            ]);
 
             foreach (['Name', 'Uniquename'] as $required) {
                 if (!isset($col_map[$required])) {
@@ -168,9 +173,17 @@ class StrainBulkLoader extends ChadoImporterBase
                 }
             }
 
+            // Any column not in the reserved set is treated as an entity field,
+            // with the column name used verbatim as the field machine name.
+            $reserved_cols = ['Name' => TRUE, 'Uniquename' => TRUE, 'Description' => TRUE, 'taxid' => TRUE];
+            $extra_col_map = array_diff_key($col_map, $reserved_cols);
+            $this->logger->info('Extra (non-reserved) columns mapped as field names: @cols', [
+                '@cols' => $extra_col_map ? implode(', ', array_keys($extra_col_map)) : '(none)',
+            ]);
+
             // Open a Connection to the default Tripal DBX managed Chado schema.
 
-                $chado = $this->getChadoConnection();
+            $chado = $this->getChadoConnection();
 
             if (!$chado instanceof Connection) {
                 throw new \RuntimeException('Could not get Chado database connection.');
@@ -189,6 +202,7 @@ class StrainBulkLoader extends ChadoImporterBase
 
                 $name       = trim((string) ($row[$col_map['Name']] ?? ''));
                 $uniquename = trim((string) ($row[$col_map['Uniquename']] ?? ''));
+
                 $description = isset($col_map['Description'])
                     ? trim((string) ($row[$col_map['Description']] ?? ''))
                     : '';
@@ -222,26 +236,20 @@ class StrainBulkLoader extends ChadoImporterBase
                     continue;
                 }
 
-                $exists = (bool) $chado->select('stock', 's')
-                    ->fields('s', ['stock_id'])
-                    ->condition('uniquename', $uniquename)
-                    ->condition('organism_id', $organism_id)
-                    ->condition('type_id', $stock_type_id)
-                    ->range(0, 1)
-                    ->execute()
-                    ->fetchField();
-
-                if ($exists) {
-                    $skipped++;
-                    $this->setItemsHandled($row_num);
-                    continue;
+                $final_uniquename = $this->ensureUniqueStockUniquename($chado, $uniquename);
+                if ($final_uniquename !== $uniquename) {
+                    $this->logger->notice('Row @row: uniquename @orig exists, using @new.', [
+                        '@row' => $row_num,
+                        '@orig' => $uniquename,
+                        '@new' => $final_uniquename,
+                    ]);
                 }
 
                 $fields = [
                     'organism_id' => $organism_id,
                     'name'        => $name,
-                    'uniquename'  => $uniquename,
-                    'type_id'     => 3, # ICICIC hardcoded germplasm cvterm_id; ideally we would resolve this from the database as well
+                    'uniquename'  => $final_uniquename,
+                    'type_id'     => 3, // $stock_type_id,
                 ];
                 if ($description !== '') {
                     $fields['description'] = $description;
@@ -250,6 +258,21 @@ class StrainBulkLoader extends ChadoImporterBase
                 $chado->insert('stock')->fields($fields)->execute();
                 $inserted++;
                 $this->setItemsHandled($row_num);
+
+                // Collect extra-column values to attach as entity field values.
+                $extra_field_values = [];
+                foreach ($extra_col_map as $field_name => $idx) {
+                    $value = trim((string) ($row[$idx] ?? ''));
+                    if ($value !== '') {
+                        $extra_field_values[$field_name] = $value;
+                    }
+                }
+
+                // Now publish the newly created stock as a Strain node in Drupal.
+                $entity = $this->publishStockAsStrainNode(
+                    (int) $chado->lastInsertId('stock_stock_id_seq'),
+                    $extra_field_values
+                );
             }
 
             unset($transaction);
@@ -266,6 +289,128 @@ class StrainBulkLoader extends ChadoImporterBase
             ]
         );
     }
+
+    protected function publishStockAsStrainNode(int $stock_id, array $extra_field_values = []): ?\Drupal\tripal\Entity\TripalEntity
+    {
+        // Publish the stock record as a Tripal entity using the ChadoPublish plugin.
+        // ChadoPublish is a Drupal plugin with dependency injection, so it must be
+        // instantiated via its plugin manager.
+        try {
+            /** @var \Drupal\tripal\TripalBackendPublish\PluginManager\TripalBackendPublishManager $publish_manager */
+            $publish_manager = \Drupal::service('tripal.backend_publish');
+            /** @var \Drupal\tripal_chado\Plugin\TripalBackendPublish\ChadoPublish $publisher */
+            $publisher = $publish_manager->createInstance('chado_storage');
+            $res = $publisher->publish([
+                'bundle' => 'germplasm',
+                'datastore' => 'chado_storage',
+                'batch_size' => 1,
+                'republish' => FALSE,
+            ]);
+            // publish() returns [title => entity_id] for up to the first 100
+            // published entities. It does not include chado record IDs, so we
+            // cannot verify $stock_id here — the entity lookup below handles
+            // the "was this record actually published?" check.
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to publish stock_id @id: @error', [
+                '@id' => $stock_id,
+                '@error' => $e->getMessage(),
+            ]);
+            return NULL;
+        }
+
+        // Retrieve the published entity.
+        $entity_lookup = \Drupal::service('tripal.tripal_entity.lookup');
+        $entity_id = $entity_lookup->getEntityId($stock_id, NULL, NULL, 'stock');
+
+        if (!$entity_id) {
+            $this->logger->warning('Published stock_id @id but entity lookup returned NULL.', [
+                '@id' => $stock_id,
+            ]);
+            return NULL;
+        }
+
+        $entity = \Drupal::entityTypeManager()->getStorage('tripal_entity')->load($entity_id);
+        if (!$entity) {
+            return NULL;
+        }
+
+        // Apply any extra columns as field values on the entity. The column
+        // name is used verbatim as the field machine name.
+        if ($extra_field_values) {
+            $this->logger->info(
+                'stock_id @id: attempting to set @count extra field value(s): @fields',
+                [
+                    '@id' => $stock_id,
+                    '@count' => count($extra_field_values),
+                    '@fields' => implode(', ', array_keys($extra_field_values)),
+                ]
+            );
+            $available_fields = array_keys($entity->getFieldDefinitions());
+            $this->logger->info(
+                'stock_id @id: entity bundle @bundle has fields: @all',
+                [
+                    '@id' => $stock_id,
+                    '@bundle' => $entity->bundle(),
+                    '@all' => implode(', ', $available_fields),
+                ]
+            );
+            $changed = FALSE;
+            foreach ($extra_field_values as $field_name => $value) {
+                if (!$entity->hasField($field_name)) {
+                    $this->logger->warning(
+                        'Entity for stock_id @id has no field @field; skipping. Value was: @value',
+                        ['@id' => $stock_id, '@field' => $field_name, '@value' => $value]
+                    );
+                    continue;
+                }
+                $this->logger->info(
+                    'stock_id @id: setting field @field = @value',
+                    ['@id' => $stock_id, '@field' => $field_name, '@value' => $value]
+                );
+                try {
+                    $entity->set($field_name, $value);
+                    $stored = $entity->get($field_name)->getValue();
+                    $this->logger->info(
+                        'stock_id @id: field @field after set() contains: @stored',
+                        ['@id' => $stock_id, '@field' => $field_name, '@stored' => print_r($stored, TRUE)]
+                    );
+                    $changed = TRUE;
+                } catch (\Exception $e) {
+                    $this->logger->error(
+                        'Failed to set field @field on stock_id @id: @error',
+                        ['@field' => $field_name, '@id' => $stock_id, '@error' => $e->getMessage()]
+                    );
+                }
+            }
+            if ($changed) {
+                try {
+                    $entity->save();
+                    $this->logger->info('stock_id @id: entity saved.', ['@id' => $stock_id]);
+                    // Reload and verify the values persisted.
+                    $reloaded = \Drupal::entityTypeManager()
+                        ->getStorage('tripal_entity')
+                        ->loadUnchanged($entity->id());
+                    foreach ($extra_field_values as $field_name => $value) {
+                        if ($reloaded && $reloaded->hasField($field_name)) {
+                            $persisted = $reloaded->get($field_name)->getValue();
+                            $this->logger->info(
+                                'stock_id @id: reloaded field @field contains: @persisted',
+                                ['@id' => $stock_id, '@field' => $field_name, '@persisted' => print_r($persisted, TRUE)]
+                            );
+                        }
+                    }
+                } catch (\Exception $e) {
+                    $this->logger->error(
+                        'Failed to save entity for stock_id @id: @error',
+                        ['@id' => $stock_id, '@error' => $e->getMessage()]
+                    );
+                }
+            }
+        }
+
+        return $entity;
+    }
+
 
     /**
      * Detects the delimiter from the first line of the file.
@@ -290,6 +435,42 @@ class StrainBulkLoader extends ChadoImporterBase
             }
         }
         return $map;
+    }
+
+    /**
+     * Ensures stock.uniquename is globally unique by appending a UUID on conflict.
+     */
+    protected function ensureUniqueStockUniquename(Connection $chado, string $base_uniquename): string
+    {
+        $base_uniquename = trim($base_uniquename);
+        if ($base_uniquename === '') {
+            $base_uniquename = 'strain';
+        }
+
+        $candidate = $base_uniquename;
+        $max_length = 255;
+
+        while ($this->stockUniquenameExists($chado, $candidate)) {
+            $uuid = \Drupal::service('uuid')->generate();
+            $suffix = '--' . $uuid;
+            $prefix_max = max(1, $max_length - strlen($suffix));
+            $candidate = substr($base_uniquename, 0, $prefix_max) . $suffix;
+        }
+
+        return $candidate;
+    }
+
+    /**
+     * Checks if a stock.uniquename already exists.
+     */
+    protected function stockUniquenameExists(Connection $chado, string $uniquename): bool
+    {
+        return (bool) $chado->select('stock', 's')
+            ->fields('s', ['stock_id'])
+            ->condition('uniquename', $uniquename)
+            ->range(0, 1)
+            ->execute()
+            ->fetchField();
     }
 
     /**
@@ -334,16 +515,16 @@ class StrainBulkLoader extends ChadoImporterBase
     {
         // Get the feature property CV object
         $cv = $chado->select('cv')
-        ->fields('cv')
-        ->condition('name', 'germplasm_ontology')
-        ->execute()
-        ->fetchObject();
+            ->fields('cv')
+            ->condition('name', 'germplasm_ontology')
+            ->execute()
+            ->fetchObject();
 
 
         if (is_null($cv)) {
             throw new \Exception(t("Cannot find the 'germplasm_ontology' ontology'", []));
         }
-      
+
         $id = $chado->select('cvterm')
             ->fields('cvterm', ['cvterm_id'])
             ->condition('name', 'generated germplasm')
