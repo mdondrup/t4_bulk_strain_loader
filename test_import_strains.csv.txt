@@ -1,4 +1,4 @@
-Name,Uniquename,Description,taxid,field_contact
-"Tore Testers kveik","kveikbank-83927","Oh my gosh, that's a tasty booze","NCBITaxon:4932","tore.tester@kveikbase.org"
-"Snørre åse1 kvikk","kveikbank-638288","120%","NCBITaxon:4932","Snorre@kveikbase.org"
-"Willi wursts kveik","kveikbank-32911","It's not at Beer it's a Wurst (or Supergrobi)","NCBITaxon:4932","willi@wurtskveik.com"
+Name,Uniquename,Description,taxid,field_contact,field_last_used_in_brewing,field_sampling_date,field_strain_geolocation
+"Tore Testers kveik","kveikbank-83927","Oh my gosh, that's a tasty booze","NCBITaxon:4932","tore.tester@kveikbase.org","2023-03-04","2023-03-08","51.47879,-0.010677"
+"Snørre åse1 kvikk","kveikbank-638288","120%","NCBITaxon:4932","Snorre@kveikbase.org","2021-04-01","2023-03-04"
+"Willi wursts kveik","kveikbank-32911","It's not at Beer it's a Wurst (or Supergrobi)","NCBITaxon:4932","willi@wurtskveik.com","2014-6-6","2023-03-04","55.47879,-0.090677"

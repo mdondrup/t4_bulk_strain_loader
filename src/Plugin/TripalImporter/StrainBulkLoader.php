@@ -49,6 +49,9 @@ class StrainBulkLoader extends ChadoImporterBase
 
     public static $file_types = ['csv', 'tsv', 'txt'];
 
+    public static $upload_description = 'Provide a CSV or TAB-delimited file with a header row containing at minimum the columns Name and Uniquename. Optional columns: Description, taxid.';
+    public static $upload_title = 'Strain File';
+
     /**
      * {@inheritdoc}
      */
@@ -74,13 +77,28 @@ class StrainBulkLoader extends ChadoImporterBase
         // Always call the parent form.
         $form = parent::form($form, $form_state);
 
+        $organism_options = $this->getOrganismOptions();
+
         $form['organism_id'] = [
-            '#type'          => 'number',
-            '#title'         => t('Default Organism ID'),
-            '#description'   => t('Chado organism_id used when a row has no taxid or the taxid cannot be resolved.'),
+            '#type'          => 'select',
+            '#title'         => t('Default Organism'),
+            '#description'   => t('Chado organism used when a row has no taxid or the taxid cannot be resolved.'),
             '#required'      => TRUE,
-            '#min'           => 1,
-            '#step'          => 1,
+            '#options'       => $organism_options,
+            '#empty_option'  => t('- Select an organism -'),
+        ];
+
+        $form['uniquename_clash'] = [
+            '#type'          => 'radios',
+            '#title'         => t('On uniquename clash'),
+            '#description'   => t('What to do when a row\'s Uniquename already exists in the stock table.'),
+            '#required'      => TRUE,
+            '#default_value' => 'update',
+            '#options'       => [
+                'ignore' => t('Ignore: skip the row, leaving the existing stock unchanged.'),
+                'update' => t('Update: overwrite the existing stock\'s fields with values from this row.'),
+                'rename' => t('Rename: insert a new stock with a UUID-suffixed uniquename.'),
+            ],
         ];
 
         return $form;
@@ -173,29 +191,81 @@ class StrainBulkLoader extends ChadoImporterBase
                 }
             }
 
-            // Any column not in the reserved set is treated as an entity field,
-            // with the column name used verbatim as the field machine name.
-            $reserved_cols = ['Name' => TRUE, 'Uniquename' => TRUE, 'Description' => TRUE, 'taxid' => TRUE];
-            $extra_col_map = array_diff_key($col_map, $reserved_cols);
-            $this->logger->info('Extra (non-reserved) columns mapped as field names: @cols', [
-                '@cols' => $extra_col_map ? implode(', ', array_keys($extra_col_map)) : '(none)',
+            // Detect cross-reference columns: any header starting with
+            // "field_xref_". The suffix is the chado.db.name. Multiple columns
+            // sharing the same header are supported (each contributes one
+            // accession), so we work directly off $raw_header rather than
+            // $col_map (which de-dupes).
+            //
+            // $xref_col_map: db_name => list<int> of column indexes.
+            $xref_col_map = [];
+            $xref_reserved = [];
+            foreach ($raw_header as $i => $col) {
+                $name = trim((string) $col);
+                if (strpos($name, 'field_xref_') === 0) {
+                    $db_name = substr($name, strlen('field_xref_'));
+                    if ($db_name === '') {
+                        continue;
+                    }
+                    $xref_col_map[$db_name][] = $i;
+                    $xref_reserved[$name] = TRUE;
+                }
+            }
+            $this->logger->info('Detected xref columns: @cols', [
+                '@cols' => $xref_col_map ? implode(', ', array_keys($xref_col_map)) : '(none)',
             ]);
 
             // Open a Connection to the default Tripal DBX managed Chado schema.
+            // All TripalImporter runs are exectuted in a trans
+            // action, so if anything goes wrong the Chado database will be rolled back to its previous state.
 
             $chado = $this->getChadoConnection();
 
             if (!$chado instanceof Connection) {
                 throw new \RuntimeException('Could not get Chado database connection.');
             }
+
+            // Validate that every referenced db exists in chado.db; abort
+            // up-front if any are missing so we don't insert partial data.
+            $xref_db_ids = [];
+            $missing_dbs = [];
+            foreach (array_keys($xref_col_map) as $db_name) {
+                $db_id = $this->findDbIdByName($chado, $db_name);
+                if ($db_id === NULL) {
+                    $missing_dbs[] = $db_name;
+                } else {
+                    $xref_db_ids[$db_name] = $db_id;
+                }
+            }
+            if ($missing_dbs) {
+                throw new \RuntimeException(sprintf(
+                    'The following xref db(s) are not present in chado.db: %s. Add them before importing.',
+                    implode(', ', $missing_dbs)
+                ));
+            }
+
+            // Any column not in the reserved set (and not an xref column) is
+            // treated as an entity field, with the column name used verbatim
+            // as the field machine name.
+            $reserved_cols = ['Name' => TRUE, 'Uniquename' => TRUE, 'Description' => TRUE, 'taxid' => TRUE]
+                + $xref_reserved;
+            $extra_col_map = array_diff_key($col_map, $reserved_cols);
+            $this->logger->info('Extra (non-reserved) columns mapped as field names: @cols', [
+                '@cols' => $extra_col_map ? implode(', ', array_keys($extra_col_map)) : '(none)',
+            ]);
             $stock_type_id = $this->resolveStrainTypeId($chado);
             $default_organism_id = (int) ($this->arguments['run_args']['organism_id'] ?? 0);
+            $clash_mode = (string) ($this->arguments['run_args']['uniquename_clash'] ?? 'update');
+            if (!in_array($clash_mode, ['ignore', 'update', 'rename'], TRUE)) {
+                $clash_mode = 'update';
+            }
+            $this->logger->info('Uniquename clash handling: @mode', ['@mode' => $clash_mode]);
 
             $inserted = 0;
+            $updated = 0;
             $skipped = 0;
             $row_num = 0;
 
-            $transaction = $chado->startTransaction();
 
             while (($row = fgetcsv($handle, 0, $delimiter)) !== FALSE) {
                 $row_num++;
@@ -236,28 +306,84 @@ class StrainBulkLoader extends ChadoImporterBase
                     continue;
                 }
 
-                $final_uniquename = $this->ensureUniqueStockUniquename($chado, $uniquename);
-                if ($final_uniquename !== $uniquename) {
-                    $this->logger->notice('Row @row: uniquename @orig exists, using @new.', [
-                        '@row' => $row_num,
-                        '@orig' => $uniquename,
-                        '@new' => $final_uniquename,
-                    ]);
+                $existing_stock_id = $this->findStockIdByUniquename($chado, $uniquename);
+                $stock_id = NULL;
+
+                if ($existing_stock_id !== NULL) {
+                    if ($clash_mode === 'ignore') {
+                        $this->logger->notice('Row @row: uniquename @u exists (stock_id @sid) — ignoring.', [
+                            '@row' => $row_num,
+                            '@u' => $uniquename,
+                            '@sid' => $existing_stock_id,
+                        ]);
+                        $skipped++;
+                        continue;
+                    }
+
+                    if ($clash_mode === 'update') {
+                        $update_fields = [
+                            'organism_id' => $organism_id,
+                            'name'        => $name,
+                            'type_id'     => 3, // $stock_type_id, must equal the cvterm_id used when creating germplasm
+                        ];
+                        if ($description !== '') {
+                            $update_fields['description'] = $description;
+                        }
+                        $chado->update('stock')
+                            ->fields($update_fields)
+                            ->condition('stock_id', $existing_stock_id)
+                            ->execute();
+                        $stock_id = $existing_stock_id;
+                        $updated++;
+                        $this->logger->notice('Row @row: uniquename @u exists (stock_id @sid) — updated.', [
+                            '@row' => $row_num,
+                            '@u' => $uniquename,
+                            '@sid' => $existing_stock_id,
+                        ]);
+                    }
+                    elseif ($clash_mode === 'rename') {
+                        $final_uniquename = $this->ensureUniqueStockUniquename($chado, $uniquename);
+                        $this->logger->notice('Row @row: uniquename @orig exists, using @new.', [
+                            '@row' => $row_num,
+                            '@orig' => $uniquename,
+                            '@new' => $final_uniquename,
+                        ]);
+                        $fields = [
+                            'organism_id' => $organism_id,
+                            'name'        => $name,
+                            'uniquename'  => $final_uniquename,
+                            'type_id'     => 3,
+                        ];
+                        if ($description !== '') {
+                            $fields['description'] = $description;
+                        }
+                        $chado->insert('stock')->fields($fields)->execute();
+                        $stock_id = (int) $chado->lastInsertId('stock_stock_id_seq');
+                        $inserted++;
+                    }
+                }
+                else {
+                    // No clash — straightforward insert.
+                    $fields = [
+                        'organism_id' => $organism_id,
+                        'name'        => $name,
+                        'uniquename'  => $uniquename,
+                        'type_id'     => 3,
+                    ];
+                    if ($description !== '') {
+                        $fields['description'] = $description;
+                    }
+                    $chado->insert('stock')->fields($fields)->execute();
+                    $stock_id = (int) $chado->lastInsertId('stock_stock_id_seq');
+                    $inserted++;
                 }
 
-                $fields = [
-                    'organism_id' => $organism_id,
-                    'name'        => $name,
-                    'uniquename'  => $final_uniquename,
-                    'type_id'     => 3, // $stock_type_id,
-                ];
-                if ($description !== '') {
-                    $fields['description'] = $description;
-                }
-
-                $chado->insert('stock')->fields($fields)->execute();
-                $inserted++;
                 $this->setItemsHandled($row_num);
+
+                // Process cross-reference columns: insert dbxref + stock_dbxref
+                // for each non-empty xref value. Multiple columns of the same
+                // db are supported.
+                $this->applyStockXrefs($chado, $stock_id, $row, $xref_col_map, $xref_db_ids, $row_num);
 
                 // Collect extra-column values to attach as entity field values.
                 $extra_field_values = [];
@@ -268,23 +394,23 @@ class StrainBulkLoader extends ChadoImporterBase
                     }
                 }
 
-                // Now publish the newly created stock as a Strain node in Drupal.
+                // Publish the new/updated stock as a Strain entity in Drupal.
                 $entity = $this->publishStockAsStrainNode(
-                    (int) $chado->lastInsertId('stock_stock_id_seq'),
+                    $stock_id,
                     $extra_field_values
                 );
             }
 
-            unset($transaction);
         } finally {
             fclose($handle);
         }
 
         $this->logger->info(
-            'Completed: @total row(s) processed, @inserted inserted, @skipped skipped.',
+            'Completed: @total row(s) processed, @inserted inserted, @updated updated, @skipped skipped.',
             [
                 '@total'    => $row_num ?? 0,
                 '@inserted' => $inserted ?? 0,
+                '@updated'  => $updated ?? 0,
                 '@skipped'  => $skipped ?? 0,
             ]
         );
@@ -300,10 +426,22 @@ class StrainBulkLoader extends ChadoImporterBase
             $publish_manager = \Drupal::service('tripal.backend_publish');
             /** @var \Drupal\tripal_chado\Plugin\TripalBackendPublish\ChadoPublish $publisher */
             $publisher = $publish_manager->createInstance('chado_storage');
-            $res = $publisher->publish([
+            // Publish the last entered stock record. Because the process is in a transaction,
+            // the ChadoPublish plugin will see only the exact last record when it queries for unpublished stocks.  
+            $publisher->publish([
                 'bundle' => 'germplasm',
                 'datastore' => 'chado_storage',
                 'batch_size' => 1,
+                // Only publish records that don't already have a Tripal
+                // entity. ChadoPublish::publish() does NOT support filtering
+                // by record_id, so 'republish' => TRUE would re-publish every
+                // entity in the bundle on every row (O(N^2)). For
+                // already-published stocks (clash mode 'update' or new
+                // stock_dbxref rows added by applyStockXrefs) we instead
+                // refresh the single affected entity below by calling
+                // $entity->save(): TripalEntity::preSave() invokes
+                // ChadoStorage::loadValues() which re-reads the field values
+                // from Chado, including newly-linked dbxref rows.
                 'republish' => FALSE,
             ]);
             // publish() returns [title => entity_id] for up to the first 100
@@ -334,6 +472,12 @@ class StrainBulkLoader extends ChadoImporterBase
             return NULL;
         }
 
+        // Track whether anything changed so we know to save. We always want to
+        // save once per row regardless of extra fields so the entity's Drupal
+        // field cache is refreshed from Chado (this picks up new stock_dbxref
+        // linker rows added by applyStockXrefs()).
+        $changed = TRUE;
+
         // Apply any extra columns as field values on the entity. The column
         // name is used verbatim as the field machine name.
         if ($extra_field_values) {
@@ -354,7 +498,6 @@ class StrainBulkLoader extends ChadoImporterBase
                     '@all' => implode(', ', $available_fields),
                 ]
             );
-            $changed = FALSE;
             foreach ($extra_field_values as $field_name => $value) {
                 if (!$entity->hasField($field_name)) {
                     $this->logger->warning(
@@ -363,49 +506,72 @@ class StrainBulkLoader extends ChadoImporterBase
                     );
                     continue;
                 }
-                $this->logger->info(
-                    'stock_id @id: setting field @field = @value',
-                    ['@id' => $stock_id, '@field' => $field_name, '@value' => $value]
-                );
+
+                $def = $entity->getFieldDefinition($field_name);
+                $type = $def->getType();
+
                 try {
-                    $entity->set($field_name, $value);
-                    $stored = $entity->get($field_name)->getValue();
-                    $this->logger->info(
-                        'stock_id @id: field @field after set() contains: @stored',
-                        ['@id' => $stock_id, '@field' => $field_name, '@stored' => print_r($stored, TRUE)]
-                    );
-                    $changed = TRUE;
-                } catch (\Exception $e) {
-                    $this->logger->error(
-                        'Failed to set field @field on stock_id @id: @error',
-                        ['@field' => $field_name, '@id' => $stock_id, '@error' => $e->getMessage()]
-                    );
-                }
-            }
-            if ($changed) {
-                try {
-                    $entity->save();
-                    $this->logger->info('stock_id @id: entity saved.', ['@id' => $stock_id]);
-                    // Reload and verify the values persisted.
-                    $reloaded = \Drupal::entityTypeManager()
-                        ->getStorage('tripal_entity')
-                        ->loadUnchanged($entity->id());
-                    foreach ($extra_field_values as $field_name => $value) {
-                        if ($reloaded && $reloaded->hasField($field_name)) {
-                            $persisted = $reloaded->get($field_name)->getValue();
-                            $this->logger->info(
-                                'stock_id @id: reloaded field @field contains: @persisted',
-                                ['@id' => $stock_id, '@field' => $field_name, '@persisted' => print_r($persisted, TRUE)]
-                            );
-                        }
+                    switch ($type) {
+                        case 'geolocation':
+                            [$lat, $lng] = array_map('trim', explode(',', $value, 2));
+                            $entity->set($field_name, ['lat' => (float) $lat, 'lng' => (float) $lng]);
+                            break;
+
+                        case 'geofield':
+                            // Accept either "lat,lng" or a raw WKT string.
+                            if (stripos($value, 'POINT') === 0) {
+                                $entity->set($field_name, ['value' => $value]);
+                            } else {
+                                [$lat, $lng] = array_map('trim', explode(',', $value, 2));
+                                $entity->set($field_name, ['value' => "POINT($lng $lat)"]);
+                            }
+                            break;
+
+                        default:
+                            // Atomic scalar fallback (string, integer, datetime, etc.).
+                            $entity->set($field_name, $value);
                     }
                 } catch (\Exception $e) {
-                    $this->logger->error(
-                        'Failed to save entity for stock_id @id: @error',
-                        ['@id' => $stock_id, '@error' => $e->getMessage()]
-                    );
+                    $this->logger->error('Failed to set @field on stock_id @id (@type): @error', [
+                        '@field' => $field_name,
+                        '@id' => $stock_id,
+                        '@type' => $type,
+                        '@error' => $e->getMessage(),
+                    ]);
                 }
             }
+        }
+
+        // Always save the just-touched entity once per row. Saving an existing
+        // TripalEntity triggers TripalEntity::preSave() which calls each
+        // storage backend's loadValues() and re-reads field values from Chado.
+        // This is how the new stock_dbxref linker rows added in
+        // applyStockXrefs() get mirrored into the Drupal field tables, without
+        // having to republish the whole bundle (ChadoPublish has no
+        // per-record-id filter).
+        try {
+            $entity->save();
+            $this->logger->info('stock_id @id: entity saved (field cache refreshed from Chado).', ['@id' => $stock_id]);
+            if ($extra_field_values) {
+                // Reload and verify the extra-field values persisted.
+                $reloaded = \Drupal::entityTypeManager()
+                    ->getStorage('tripal_entity')
+                    ->loadUnchanged($entity->id());
+                foreach ($extra_field_values as $field_name => $value) {
+                    if ($reloaded && $reloaded->hasField($field_name)) {
+                        $persisted = $reloaded->get($field_name)->getValue();
+                        $this->logger->info(
+                            'stock_id @id: reloaded field @field contains: @persisted',
+                            ['@id' => $stock_id, '@field' => $field_name, '@persisted' => print_r($persisted, TRUE)]
+                        );
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            $this->logger->error(
+                'Failed to save entity for stock_id @id: @error',
+                ['@id' => $stock_id, '@error' => $e->getMessage()]
+            );
         }
 
         return $entity;
@@ -471,6 +637,193 @@ class StrainBulkLoader extends ChadoImporterBase
             ->range(0, 1)
             ->execute()
             ->fetchField();
+    }
+
+    /**
+     * Returns the stock_id for an existing stock.uniquename, or NULL.
+     */
+    protected function findStockIdByUniquename(Connection $chado, string $uniquename): ?int
+    {
+        $id = $chado->select('stock', 's')
+            ->fields('s', ['stock_id'])
+            ->condition('uniquename', $uniquename)
+            ->range(0, 1)
+            ->execute()
+            ->fetchField();
+        return $id ? (int) $id : NULL;
+    }
+
+    /**
+     * Returns the db_id for an entry in chado.db, or NULL when not found.
+     */
+    protected function findDbIdByName(Connection $chado, string $db_name): ?int
+    {
+        $id = $chado->select('db', 'd')
+            ->fields('d', ['db_id'])
+            ->condition('name', $db_name)
+            ->range(0, 1)
+            ->execute()
+            ->fetchField();
+        return $id ? (int) $id : NULL;
+    }
+
+    /**
+     * Returns an existing dbxref_id for (db_id, accession), or NULL.
+     */
+    protected function findDbxrefId(Connection $chado, int $db_id, string $accession): ?int
+    {
+        $id = $chado->select('dbxref', 'x')
+            ->fields('x', ['dbxref_id'])
+            ->condition('db_id', $db_id)
+            ->condition('accession', $accession)
+            ->range(0, 1)
+            ->execute()
+            ->fetchField();
+        return $id ? (int) $id : NULL;
+    }
+
+    /**
+     * Inserts a chado.dbxref row if missing and returns its dbxref_id.
+     */
+    protected function findOrCreateDbxref(Connection $chado, int $db_id, string $accession): int
+    {
+        $existing = $this->findDbxrefId($chado, $db_id, $accession);
+        if ($existing !== NULL) {
+            return $existing;
+        }
+        $chado->insert('dbxref')
+            ->fields(['db_id' => $db_id, 'accession' => $accession])
+            ->execute();
+        return (int) $chado->lastInsertId('dbxref_dbxref_id_seq');
+    }
+
+    /**
+     * For each xref column in this row, ensure a chado.dbxref exists and link
+     * it to the stock via chado.stock_dbxref (idempotent).
+     *
+     * @param array<string, list<int>> $xref_col_map  db_name => [col indexes]
+     * @param array<string, int>       $xref_db_ids   db_name => db_id
+     */
+    protected function applyStockXrefs(
+        Connection $chado,
+        int $stock_id,
+        array $row,
+        array $xref_col_map,
+        array $xref_db_ids,
+        int $row_num
+    ): void {
+        foreach ($xref_col_map as $db_name => $indexes) {
+            $db_id = $xref_db_ids[$db_name] ?? NULL;
+            if (!$db_id) {
+                continue;
+            }
+            foreach ($indexes as $idx) {
+                $value = trim((string) ($row[$idx] ?? ''));
+                if ($value === '') {
+                    continue;
+                }
+
+                // If the value is prefixed with the db name (case-insensitive),
+                // strip it. e.g. "PMID:30150001" with db "pubmed" or "PMID"
+                // becomes "30150001".
+                $accession = $value;
+                if (strpos($accession, ':') !== FALSE) {
+                    [$prefix, $rest] = explode(':', $accession, 2);
+                    if (strcasecmp(trim($prefix), $db_name) === 0) {
+                        $accession = trim($rest);
+                    }
+                }
+                if ($accession === '') {
+                    continue;
+                }
+
+                try {
+                    $dbxref_id = $this->findOrCreateDbxref($chado, $db_id, $accession);
+
+                    // Link to stock if not already linked.
+                    $linked = $chado->select('stock_dbxref', 'sd')
+                        ->fields('sd', ['stock_dbxref_id'])
+                        ->condition('stock_id', $stock_id)
+                        ->condition('dbxref_id', $dbxref_id)
+                        ->range(0, 1)
+                        ->execute()
+                        ->fetchField();
+                    if (!$linked) {
+                        $chado->insert('stock_dbxref')
+                            ->fields(['stock_id' => $stock_id, 'dbxref_id' => $dbxref_id])
+                            ->execute();
+                        $this->logger->notice(
+                            'Row @row: linked xref @db:@acc (dbxref_id @xid) to stock_id @sid.',
+                            [
+                                '@row' => $row_num,
+                                '@db'  => $db_name,
+                                '@acc' => $accession,
+                                '@xid' => $dbxref_id,
+                                '@sid' => $stock_id,
+                            ]
+                        );
+                    } else {
+                        $this->logger->info(
+                            'Row @row: xref @db:@acc already linked to stock_id @sid (skip).',
+                            [
+                                '@row' => $row_num,
+                                '@db'  => $db_name,
+                                '@acc' => $accession,
+                                '@sid' => $stock_id,
+                            ]
+                        );
+                    }
+                } catch (\Exception $e) {
+                    $this->logger->error(
+                        'Row @row: failed to attach xref @db:@acc to stock_id @sid: @err',
+                        [
+                            '@row' => $row_num,
+                            '@db' => $db_name,
+                            '@acc' => $accession,
+                            '@sid' => $stock_id,
+                            '@err' => $e->getMessage(),
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds a select-options array of all organisms in chado.organism.
+     *
+     * Keys are organism_id; values are human-readable labels of the form
+     * "Genus species (infraspecific)" with abbreviation when present.
+     *
+     * @return array<int, string>
+     */
+    protected function getOrganismOptions(): array
+    {
+        $options = [];
+        try {
+            $chado = $this->getChadoConnection();
+            if (!$chado instanceof Connection) {
+                return $options;
+            }
+            $rows = $chado->select('organism', 'o')
+                ->fields('o', ['organism_id', 'genus', 'species', 'abbreviation', 'infraspecific_name'])
+                ->orderBy('genus')
+                ->orderBy('species')
+                ->execute();
+            foreach ($rows as $r) {
+                $label = trim(((string) $r->genus) . ' ' . ((string) $r->species));
+                if (!empty($r->infraspecific_name)) {
+                    $label .= ' ' . $r->infraspecific_name;
+                }
+                if (!empty($r->abbreviation)) {
+                    $label .= ' (' . $r->abbreviation . ')';
+                }
+                $options[(int) $r->organism_id] = $label !== '' ? $label : ('organism_id ' . $r->organism_id);
+            }
+        } catch (\Exception $e) {
+            $this->logger->error('Could not load organism list: @err', ['@err' => $e->getMessage()]);
+        }
+        return $options;
     }
 
     /**
