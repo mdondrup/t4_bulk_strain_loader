@@ -2,43 +2,42 @@
 
 namespace Drupal\t4_bulk_strain_loader\Plugin\TripalImporter;
 
+
 use Drupal\Core\Database\Connection;
 use Drupal\tripal_chado\TripalImporter\ChadoImporterBase;
-use Drupal\tripal_chado\TripalEntity;
-use Drupal\tripal_chado\Plugin\TripalBackendPublish\ChadoPublish;
+
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\tripal\TripalImporter\Attribute\TripalImporter;
+
+
 
 /**
  * Provides a Strain Bulk Loader.
  *
- * @TripalImporter(
- *   id = "strain_bulk_loader",
- *   label = @Translation("Strain Bulk Loader"),
- *   description = @Translation("Imports strains from a CSV/TAB file where each column header is a strain name.")
- * )
  */
 
 #[TripalImporter(
     id: 'strain_bulk_loader',
     label: new TranslatableMarkup('Strain Bulk Loader'),
-    description: new TranslatableMarkup('Imports strains from a CSV/TAB file with columns: Name, Uniquename, Description, taxid.'),
+    description: new TranslatableMarkup('Bulk-imports germplasm strains from a CSV or TAB-delimited file into Chado and publishes them as Tripal entities. Supports cross-reference columns (field_xref_<db>) and arbitrary entity field columns.'),
     file_types: [
         'tsv',
         'txt',
         'csv',
     ],
-    upload_description: new TranslatableMarkup('Provide a CSV or TAB-delimited file with a header row containing at minimum the columns Name and Uniquename. Optional columns: Description, taxid.'),
+    upload_description: new TranslatableMarkup('Provide a CSV or TAB-delimited file (.csv, .tsv, .txt) with a header row. Required columns: Name, Uniquename. Optional columns: Description, taxid. Cross-reference columns: field_xref_<db_name> (one or more per database, e.g. field_xref_PMID). Any other column is treated as an entity field machine name and its value is set on the published Tripal entity.'),
     upload_title: new TranslatableMarkup('Strain File'),
-    use_analysis: false,
-    require_analysis: false,
-    use_button: true,
+    use_analysis: FALSE,
+    require_analysis: FALSE,
+    use_button: TRUE,
     button_text: new TranslatableMarkup('Import Strain file'),
-    file_upload: true,
-    file_remote: true,
-    file_local: true,
-    file_required: true,
+    file_upload: TRUE,
+    file_remote: TRUE,
+    file_local: TRUE,
+    file_required: TRUE,
     publish: [
         'bundle' => [
-            'Strain',
+            'germplasm' => new TranslatableMarkup('Strain'),
         ],
     ],
 )]
@@ -47,17 +46,14 @@ class StrainBulkLoader extends ChadoImporterBase
 {
 
 
-    public static $file_types = ['csv', 'tsv', 'txt'];
 
-    public static $upload_description = 'Provide a CSV or TAB-delimited file with a header row containing at minimum the columns Name and Uniquename. Optional columns: Description, taxid.';
-    public static $upload_title = 'Strain File';
 
     /**
      * {@inheritdoc}
      */
     public function getName()
     {
-        return t('Strain Bulk Loader');
+        return new TranslatableMarkup('Strain Bulk Loader');
     }
 
     /**
@@ -65,7 +61,7 @@ class StrainBulkLoader extends ChadoImporterBase
      */
     public function getDescription()
     {
-        return t('Imports strains from a CSV/TAB file with columns: Name, Uniquename, Description, taxid.');
+        return new TranslatableMarkup('Bulk-imports germplasm strains from a CSV or TAB-delimited file into Chado and publishes them as Tripal entities. Supports cross-reference columns (field_xref_<db>) and arbitrary entity field columns.');
     }
 
     /**
@@ -77,27 +73,66 @@ class StrainBulkLoader extends ChadoImporterBase
         // Always call the parent form.
         $form = parent::form($form, $form_state);
 
+        // Link to the bundled example file so users can download it directly
+        // from the importer page without having to upload anything manually.
+        $module_path = \Drupal::service('extension.list.module')->getPath('t4_bulk_strain_loader');
+        $example_url = \Drupal::request()->getBasePath() . '/' . $module_path . '/examples/germplasm_example.csv';
+        $form['example_file'] = [
+            '#type'   => 'item',
+            '#markup' => new TranslatableMarkup(
+                'Download <a href="@url">germplasm_example.csv</a> for a fully-annotated example file showing all supported columns.',
+                ['@url' => $example_url]
+            ),
+        ];
+
         $organism_options = $this->getOrganismOptions();
 
         $form['organism_id'] = [
             '#type'          => 'select',
-            '#title'         => t('Default Organism'),
-            '#description'   => t('Chado organism used when a row has no taxid or the taxid cannot be resolved.'),
+            '#title'         => new TranslatableMarkup('Default Organism'),
+            '#description'   => new TranslatableMarkup('Chado organism used when a row has no taxid column, or when the taxid value cannot be resolved to an organism via organismprop.'),
             '#required'      => TRUE,
             '#options'       => $organism_options,
-            '#empty_option'  => t('- Select an organism -'),
+            '#empty_option'  => new TranslatableMarkup('- Select an organism -'),
         ];
 
         $form['uniquename_clash'] = [
             '#type'          => 'radios',
-            '#title'         => t('On uniquename clash'),
-            '#description'   => t('What to do when a row\'s Uniquename already exists in the stock table.'),
+            '#title'         => new TranslatableMarkup('On uniquename clash'),
+            '#description'   => new TranslatableMarkup('What to do when a row\'s Uniquename already exists in chado.stock. Warning: Delete permanently removes existing records and does not import replacement rows.'),
             '#required'      => TRUE,
             '#default_value' => 'update',
             '#options'       => [
-                'ignore' => t('Ignore: skip the row, leaving the existing stock unchanged.'),
-                'update' => t('Update: overwrite the existing stock\'s fields with values from this row.'),
-                'rename' => t('Rename: insert a new stock with a UUID-suffixed uniquename.'),
+                'ignore' => new TranslatableMarkup('Ignore: skip this row entirely; the existing stock and its entity are left unchanged.'),
+                'update' => new TranslatableMarkup('Update: overwrite the existing stock\'s Name, Description, and organism_id with values from this row, then refresh its Tripal entity.'),
+                'rename' => new TranslatableMarkup('Rename: insert a brand-new stock using the supplied Uniquename suffixed with a UUID to avoid the clash.'),
+                'delete' => new TranslatableMarkup('Delete: permanently delete the existing stock and its linked Tripal entity. This mode does not insert or publish replacement rows.'),
+            ],
+        ];
+
+        $form['delete_warning'] = [
+            '#type' => 'item',
+            '#markup' => '<div style="color:#b00020;font-weight:700;">WARNING: Delete mode permanently removes data from Chado and Tripal entities. This action cannot be undone.</div>',
+            '#states' => [
+                'visible' => [
+                    ':input[name="uniquename_clash"]' => ['value' => 'delete'],
+                ],
+            ],
+        ];
+
+        $form['delete_confirm'] = [
+            '#type' => 'radios',
+            '#title' => new TranslatableMarkup('Delete confirmation'),
+            '#description' => new TranslatableMarkup('Type-mode confirmation for Delete runs. You must explicitly choose Yes to proceed.'),
+            '#default_value' => 'no',
+            '#options' => [
+                'no' => new TranslatableMarkup('No (safe default, abort delete run)'),
+                'yes' => new TranslatableMarkup('Yes (permanently delete matched records)'),
+            ],
+            '#states' => [
+                'visible' => [
+                    ':input[name="uniquename_clash"]' => ['value' => 'delete'],
+                ],
             ],
         ];
 
@@ -112,8 +147,19 @@ class StrainBulkLoader extends ChadoImporterBase
     /**
      * @see ChadoImporterBase::formValidate()
      */
+    public function formValidate($form, &$form_state)
+    {
+        $clash_mode = $this->getFormValue($form_state, 'uniquename_clash', 'update');
+        $delete_confirm = $this->getFormValue($form_state, 'delete_confirm', 'no');
 
-    public function formValidate($form, &$form_state) {}
+        if ($clash_mode === 'delete' && $delete_confirm !== 'yes') {
+            $this->setFormError(
+                $form_state,
+                'delete_confirm',
+                new TranslatableMarkup('Delete mode is destructive. Choose Yes under Delete confirmation to proceed, or select a non-destructive conflict option.')
+            );
+        }
+    }
 
     /**
      * @see ChadoImporterBase::run()
@@ -124,6 +170,18 @@ class StrainBulkLoader extends ChadoImporterBase
         // All values provided by the user in the Importer's form widgets are
         // made available to us here by the Class' arguments member variable.
         $arguments = $this->arguments['run_args'];
+        $clash_mode = $arguments['uniquename_clash'] ?? 'update';
+        if ($clash_mode === 'delete') {
+            // Web-form path already validates this; CLI runs (e.g. drush
+            // tripal:trp-run-import) bypass formValidate(), so prompt the
+            // operator here as well. Default answer is No.
+            if (PHP_SAPI === 'cli' && !$this->confirmDeleteOnCli()) {
+                throw new \RuntimeException('Delete run aborted by operator at CLI confirmation prompt.');
+            }
+            if (($arguments['delete_confirm'] ?? 'no') !== 'yes' && PHP_SAPI !== 'cli') {
+                throw new \RuntimeException('Delete mode requires explicit confirmation set to Yes.');
+            }
+        }
 
         // The path to the uploaded file is always made available using the
         // 'files' argument. The importer can support multiple files, therefore
@@ -185,7 +243,18 @@ class StrainBulkLoader extends ChadoImporterBase
                 '@cols' => implode(', ', array_keys($col_map)),
             ]);
 
-            foreach (['Name', 'Uniquename'] as $required) {
+            $clash_mode = (string) ($this->arguments['run_args']['uniquename_clash'] ?? 'update');
+            if (!in_array($clash_mode, ['ignore', 'update', 'rename', 'delete'], TRUE)) {
+                $clash_mode = 'update';
+            }
+            if ($clash_mode === 'delete') {
+                $this->logger->warning($this->formatCliDanger('DANGER: DELETE mode enabled. Matching records will be permanently removed and not re-imported.'));
+            }
+
+            $required_columns = $clash_mode === 'delete'
+                ? ['Uniquename']
+                : ['Name', 'Uniquename'];
+            foreach ($required_columns as $required) {
                 if (!isset($col_map[$required])) {
                     throw new \RuntimeException(sprintf('Required column "%s" not found in header.', $required));
                 }
@@ -216,8 +285,8 @@ class StrainBulkLoader extends ChadoImporterBase
             ]);
 
             // Open a Connection to the default Tripal DBX managed Chado schema.
-            // All TripalImporter runs are exectuted in a trans
-            // action, so if anything goes wrong the Chado database will be rolled back to its previous state.
+            // All TripalImporter runs are executed in a transaction,
+            // so if anything goes wrong the Chado database will be rolled back to its previous state.
 
             $chado = $this->getChadoConnection();
 
@@ -253,16 +322,17 @@ class StrainBulkLoader extends ChadoImporterBase
             $this->logger->info('Extra (non-reserved) columns mapped as field names: @cols', [
                 '@cols' => $extra_col_map ? implode(', ', array_keys($extra_col_map)) : '(none)',
             ]);
-            $stock_type_id = $this->resolveStrainTypeId($chado);
-            $default_organism_id = (int) ($this->arguments['run_args']['organism_id'] ?? 0);
-            $clash_mode = (string) ($this->arguments['run_args']['uniquename_clash'] ?? 'update');
-            if (!in_array($clash_mode, ['ignore', 'update', 'rename'], TRUE)) {
-                $clash_mode = 'update';
+            $stock_type_id = NULL;
+            $default_organism_id = 0;
+            if ($clash_mode !== 'delete') {
+                $stock_type_id = $this->resolveStrainTypeId($chado);
+                $default_organism_id = (int) ($this->arguments['run_args']['organism_id'] ?? 0);
             }
             $this->logger->info('Uniquename clash handling: @mode', ['@mode' => $clash_mode]);
 
             $inserted = 0;
             $updated = 0;
+            $deleted = 0;
             $skipped = 0;
             $row_num = 0;
 
@@ -270,8 +340,12 @@ class StrainBulkLoader extends ChadoImporterBase
             while (($row = fgetcsv($handle, 0, $delimiter)) !== FALSE) {
                 $row_num++;
 
-                $name       = trim((string) ($row[$col_map['Name']] ?? ''));
-                $uniquename = trim((string) ($row[$col_map['Uniquename']] ?? ''));
+                $name = isset($col_map['Name'])
+                    ? trim((string) ($row[$col_map['Name']] ?? ''))
+                    : '';
+                $uniquename = isset($col_map['Uniquename'])
+                    ? trim((string) ($row[$col_map['Uniquename']] ?? ''))
+                    : '';
 
                 $description = isset($col_map['Description'])
                     ? trim((string) ($row[$col_map['Description']] ?? ''))
@@ -280,9 +354,30 @@ class StrainBulkLoader extends ChadoImporterBase
                     ? trim((string) ($row[$col_map['taxid']] ?? ''))
                     : '';
 
-                if ($name === '' || $uniquename === '') {
-                    $this->logger->warning('Row @row: missing Name or Uniquename — skipping.', ['@row' => $row_num]);
+                if ($uniquename === '') {
+                    $this->logger->warning('Row @row: missing Uniquename — skipping.', ['@row' => $row_num]);
                     $skipped++;
+                    continue;
+                }
+                if ($clash_mode !== 'delete' && $name === '') {
+                    $this->logger->warning('Row @row: missing Name — skipping.', ['@row' => $row_num]);
+                    $skipped++;
+                    continue;
+                }
+
+                $existing_stock_id = $this->findStockIdByUniquename($chado, $uniquename);
+                if ($clash_mode === 'delete') {
+                    if ($existing_stock_id !== NULL) {
+                        $this->deleteStockAndEntity($chado, $existing_stock_id, $row_num, $uniquename);
+                        $deleted++;
+                    } else {
+                        $this->logger->warning($this->formatCliDanger('Row @row: uniquename @u not found — nothing to delete.'), [
+                            '@row' => $row_num,
+                            '@u' => $uniquename,
+                        ]);
+                        $skipped++;
+                    }
+                    $this->setItemsHandled($row_num);
                     continue;
                 }
 
@@ -306,7 +401,6 @@ class StrainBulkLoader extends ChadoImporterBase
                     continue;
                 }
 
-                $existing_stock_id = $this->findStockIdByUniquename($chado, $uniquename);
                 $stock_id = NULL;
 
                 if ($existing_stock_id !== NULL) {
@@ -395,6 +489,7 @@ class StrainBulkLoader extends ChadoImporterBase
                 }
 
                 // Publish the new/updated stock as a Strain entity in Drupal.
+                /** @var \Drupal\tripal\Entity\TripalEntity $entity */
                 $entity = $this->publishStockAsStrainNode(
                     $stock_id,
                     $extra_field_values
@@ -406,14 +501,20 @@ class StrainBulkLoader extends ChadoImporterBase
         }
 
         $this->logger->info(
-            'Completed: @total row(s) processed, @inserted inserted, @updated updated, @skipped skipped.',
+            'Completed: @total row(s) processed, @inserted inserted, @updated updated, @deleted deleted, @skipped skipped.',
             [
                 '@total'    => $row_num ?? 0,
                 '@inserted' => $inserted ?? 0,
                 '@updated'  => $updated ?? 0,
+                '@deleted'  => $deleted ?? 0,
                 '@skipped'  => $skipped ?? 0,
             ]
         );
+        if (($deleted ?? 0) > 0) {
+            $this->logger->warning($this->formatCliDanger('Delete summary: @deleted record(s) permanently removed.'), [
+                '@deleted' => $deleted,
+            ]);
+        }
     }
 
     protected function publishStockAsStrainNode(int $stock_id, array $extra_field_values = []): ?\Drupal\tripal\Entity\TripalEntity
@@ -466,7 +567,7 @@ class StrainBulkLoader extends ChadoImporterBase
             ]);
             return NULL;
         }
-
+        /** @var \Drupal\tripal\Entity\TripalEntity $entity */
         $entity = \Drupal::entityTypeManager()->getStorage('tripal_entity')->load($entity_id);
         if (!$entity) {
             return NULL;
@@ -554,6 +655,7 @@ class StrainBulkLoader extends ChadoImporterBase
             $this->logger->info('stock_id @id: entity saved (field cache refreshed from Chado).', ['@id' => $stock_id]);
             if ($extra_field_values) {
                 // Reload and verify the extra-field values persisted.
+                /** @var \Drupal\tripal\Entity\TripalEntity $reloaded */
                 $reloaded = \Drupal::entityTypeManager()
                     ->getStorage('tripal_entity')
                     ->loadUnchanged($entity->id());
@@ -575,6 +677,113 @@ class StrainBulkLoader extends ChadoImporterBase
         }
 
         return $entity;
+    }
+
+    /**
+     * Deletes an existing stock and its linked Tripal entity.
+     */
+    protected function deleteStockAndEntity(Connection $chado, int $stock_id, int $row_num, string $uniquename): void
+    {
+        // Delete the linked Tripal entity first, if present.
+        $entity_lookup = \Drupal::service('tripal.tripal_entity.lookup');
+        $entity_id = $entity_lookup->getEntityId($stock_id, NULL, NULL, 'stock');
+        if ($entity_id) {
+            $entity = \Drupal::entityTypeManager()->getStorage('tripal_entity')->load($entity_id);
+            if ($entity) {
+                $entity->delete();
+                $this->logger->warning($this->formatCliDanger('Row @row: deleted linked Tripal entity @eid for stock_id @sid (@u).'), [
+                    '@row' => $row_num,
+                    '@eid' => $entity_id,
+                    '@sid' => $stock_id,
+                    '@u' => $uniquename,
+                ]);
+            }
+        }
+
+        // Remove xref links before deleting the stock record.
+        $chado->delete('stock_dbxref')
+            ->condition('stock_id', $stock_id)
+            ->execute();
+
+        $chado->delete('stock')
+            ->condition('stock_id', $stock_id)
+            ->execute();
+
+        $this->logger->warning($this->formatCliDanger('Row @row: deleted existing stock_id @sid for uniquename @u.'), [
+            '@row' => $row_num,
+            '@sid' => $stock_id,
+            '@u' => $uniquename,
+        ]);
+    }
+
+    /**
+     * Returns a form value from either FormStateInterface or array-like state.
+     */
+    protected function getFormValue(&$form_state, string $key, $default = NULL)
+    {
+        if (is_object($form_state) && method_exists($form_state, 'getValue')) {
+            return $form_state->getValue($key, $default);
+        }
+        if (is_array($form_state) && array_key_exists($key, $form_state)) {
+            return $form_state[$key];
+        }
+        return $default;
+    }
+
+    /**
+     * Sets a form validation error for object or array-like form state.
+     */
+    protected function setFormError(&$form_state, string $key, TranslatableMarkup $message): void
+    {
+        if (is_object($form_state) && method_exists($form_state, 'setErrorByName')) {
+            $form_state->setErrorByName($key, $message);
+            return;
+        }
+        throw new \RuntimeException((string) $message);
+    }
+
+    /**
+     * Adds ANSI red coloring for CLI logs and keeps plain text for web logs.
+     */
+    protected function formatCliDanger(string $text): string
+    {
+        if (PHP_SAPI === 'cli') {
+            return "\033[31m{$text}\033[0m";
+        }
+        return $text;
+    }
+
+    /**
+     * Interactive Yes/No confirmation for destructive Delete runs on the CLI.
+     *
+     * Prints a red warning, reads a line from STDIN, and accepts only an
+     * explicit "yes" (case-insensitive) as confirmation. The default answer
+     * (empty input or anything else) is No.
+     */
+    protected function confirmDeleteOnCli(): bool
+    {
+        // If STDIN is not a TTY we cannot prompt safely; refuse.
+        $stdin = defined('STDIN') ? STDIN : fopen('php://stdin', 'r');
+        if (!$stdin) {
+            fwrite(STDERR, $this->formatCliDanger("Delete mode: STDIN unavailable; refusing to proceed.\n"));
+            return FALSE;
+        }
+        $is_tty = function_exists('stream_isatty') ? @stream_isatty($stdin) : FALSE;
+        if (!$is_tty) {
+            fwrite(STDERR, $this->formatCliDanger(
+                "Delete mode: no interactive TTY detected. Re-run with the form's Delete confirmation set to Yes, or run interactively.\n"
+            ));
+            return FALSE;
+        }
+
+        fwrite(STDERR, $this->formatCliDanger(
+            "DANGER: DELETE mode will permanently remove matched stock records and their Tripal entities.\n"
+        ));
+        fwrite(STDERR, $this->formatCliDanger("Type 'yes' to proceed, anything else to abort [No]: "));
+
+        $line = fgets($stdin);
+        $answer = strtolower(trim((string) $line));
+        return $answer === 'yes' || $answer === 'y';
     }
 
 
@@ -875,7 +1084,7 @@ class StrainBulkLoader extends ChadoImporterBase
 
 
         if (is_null($cv)) {
-            throw new \Exception(t("Cannot find the 'germplasm_ontology' ontology'", []));
+            throw new \Exception(new TranslatableMarkup("Cannot find the 'germplasm_ontology' ontology'", []));
         }
 
         $id = $chado->select('cvterm')
